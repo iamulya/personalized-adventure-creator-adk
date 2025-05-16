@@ -1,45 +1,208 @@
 # adventure_creator/agents.py
-from google.adk.agents import Agent
-from google.adk.tools import google_search
+from google.adk.agents import Agent, SequentialAgent
+from google.adk.tools import google_search, ToolContext, FunctionTool
+from pydantic import BaseModel, Field as PydanticField
+from typing import List, Dict, Any
+import json
 
 from .config import MODEL_NAME
 from .custom_tools import (
     google_maps_places_text_search_tool,
     google_maps_geocoding_tool,
-    generate_kml_tool
+    generate_kml_tool # This is now an async FunctionTool
 )
 
-# 1. LocationResearchAgent
-location_research_agent = Agent(
-    name="LocationResearchAgent",
+# --- State Keys for Sequential Agent ---
+STATE_KEY_RAW_POIS = "temp:raw_pois_from_location_research"
+STATE_KEY_POIS_WITH_COORDS = "temp:pois_with_coordinates"
+STATE_KEY_FORMATTED_POIS = "temp:formatted_pois_for_kml"
+STATE_KEY_KML_RESULT = "temp:kml_generation_result"
+
+# --- Agent for Broad Query Clarification ---
+class BroadQueryInput(BaseModel):
+    user_query: str = PydanticField(description="The raw user query to clarify.")
+
+broad_query_clarifier_agent = Agent(
+    name="BroadQueryClarifierAgent",
     model=MODEL_NAME,
-    instruction="You are a research assistant. Given an adventure description, identify general areas and specific Points of Interest (POIs) that match. Use Google Search for broad research and the 'search_places_text' tool for specific POIs like waterfalls, covered bridges, etc. The 'search_places_text' tool returns a list of POIs, each containing 'name', 'address', 'place_id', and potentially 'geometry' (with lat/lng). Prioritize using the 'search_places_text' tool. Return the list of found POIs.",
-    description="Identifies general areas and specific POIs based on an adventure description using Google Search and Places API.",
-    tools=[google_search, google_maps_places_text_search_tool]
+    input_schema=BroadQueryInput,
+    instruction="Input: 'user_query' string. "
+                "If 'user_query' is broad, use YOUR 'google_search' tool for themes/regions/POI types. "
+                "Output: A single string: either the original query (if specific) or a refined query/summary "
+                "clearly stating location and POI types. This string is for the next agent. "
+                "Example output: 'Search for waterfalls and hiking trails in the Black Forest, Germany.'",
+    description="Clarifies broad user queries using its Google Search tool and outputs a refined string query.",
+    tools=[google_search],
+    sub_agents=[]
 )
 
-# 2. POICoordinateFetcherAgent
-poi_coordinate_fetcher_agent = Agent(
-    name="POICoordinateFetcherAgent",
+# --- Wrapper Agents for the Sequential Orchestrator ---
+class LocationResearchWrapperInput(BaseModel):
+    adventure_description: str = PydanticField(description="The refined adventure description to research POIs for.")
+
+def research_and_store_pois_for_sequential(adventure_description: str, tool_context: ToolContext):
+    if not adventure_description:
+        tool_context.state[STATE_KEY_RAW_POIS] = json.dumps([])
+        return "Error: No adventure description provided for POI research."
+    print(f"[LocationResearchWrapper-Tool] Received adventure_description: '{adventure_description}'")
+    raw_pois = google_maps_places_text_search_tool.func(query=adventure_description, tool_context=tool_context)
+    tool_context.state[STATE_KEY_RAW_POIS] = json.dumps(raw_pois if raw_pois else [])
+    count = len(raw_pois) if isinstance(raw_pois, list) else 0
+    return f"POI research complete. Found {count} POIs. Stored in state."
+
+research_and_store_pois_tool_for_seq = FunctionTool(research_and_store_pois_for_sequential)
+
+location_research_agent_wrapper = Agent(
+    name="LocationResearchAgentWrapper",
     model=MODEL_NAME,
-    instruction="You are a data fetcher. You will receive a list of POIs. Each POI might have 'name', 'address', 'place_id', and 'geometry' (which contains 'location' with 'lat' and 'lng'). Your task is to ensure each POI has 'lat' and 'lng' coordinates. \n1. If a POI already has  and , extract these values directly for 'lat' and 'lng'. \n2. If a POI is missing these explicit coordinates in its 'geometry', use its 'address' with the 'geocode_address' tool to get them. \nReturn a list of POIs, each guaranteed to have 'name', 'address' (original or fetched), 'lat', and 'lng'. If geocoding fails for an address, note the error but try to process other POIs.",
-    description="Gets precise coordinates for identified POIs. Uses existing coordinates from 'geometry' if available, otherwise geocodes using 'address'.",
-    tools=[google_maps_geocoding_tool]
+    input_schema=LocationResearchWrapperInput,
+    instruction=f"""Your task is to initiate POI research.
+    1. You will receive an 'adventure_description' as input.
+    2. Call the 'research_and_store_pois_for_sequential' tool, passing this 'adventure_description' to it.
+       This tool will perform the search and store the resulting list of POIs (as a JSON string) into state key: '{STATE_KEY_RAW_POIS}'.
+    3. Output the confirmation message returned by the tool.""",
+    tools=[research_and_store_pois_tool_for_seq],
 )
 
-# 3. MapDataFormatterAgent
-map_data_formatter_agent = Agent(
-    name="MapDataFormatterAgent",
+async def fetch_coords_and_store_for_sequential(tool_context: ToolContext): # MODIFIED to be async
+    raw_pois_json_string = tool_context.state.get(STATE_KEY_RAW_POIS)
+    if not raw_pois_json_string:
+        tool_context.state[STATE_KEY_POIS_WITH_COORDS] = json.dumps({"error": "No raw POIs found in state for coordinate fetching."})
+        return "Error: No raw POIs found in state for coordinate fetching."
+    try:
+        raw_pois = json.loads(raw_pois_json_string)
+        if not isinstance(raw_pois, list):
+            raise json.JSONDecodeError("Raw POIs is not a list", raw_pois_json_string,0)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding raw_pois_json_string: {e}. Content: '{raw_pois_json_string}'")
+        tool_context.state[STATE_KEY_POIS_WITH_COORDS] = json.dumps({"error": f"Invalid JSON in raw POIs state: {e}"})
+        return f"Error: Invalid JSON in raw POIs state for coordinate fetching: {e}"
+
+    results_with_coords = []
+    for poi in raw_pois:
+        if not isinstance(poi, dict):
+            results_with_coords.append({"error": "Invalid POI format, not a dictionary.", "original_poi": poi})
+            continue
+        if poi.get("geometry") and isinstance(poi["geometry"], dict) and poi["geometry"].get("location"):
+            loc = poi["geometry"]["location"]
+            if isinstance(loc, dict) and "lat" in loc and "lng" in loc:
+                results_with_coords.append({**poi, "lat": loc["lat"], "lng": loc["lng"]})
+                continue
+        
+        address = poi.get("address")
+        if address and isinstance(address, str):
+            # geocode_address is sync, so no await here for google_maps_geocoding_tool.func
+            coords = google_maps_geocoding_tool.func(address=address, tool_context=tool_context)
+            if isinstance(coords, dict) and "error" not in coords:
+                results_with_coords.append({**poi, **coords})
+            else:
+                error_msg = coords.get("error", "Unknown geocoding error") if isinstance(coords, dict) else "Geocoding returned non-dict"
+                results_with_coords.append({**poi, "error": f"Geocoding failed: {error_msg}"})
+        else:
+            results_with_coords.append({**poi, "error": "Missing or invalid address for geocoding"})
+            
+    tool_context.state[STATE_KEY_POIS_WITH_COORDS] = json.dumps(results_with_coords)
+    return f"Coordinate fetching complete. Processed {len(raw_pois)} POIs. Stored in state."
+
+fetch_coords_and_store_tool_for_seq = FunctionTool(fetch_coords_and_store_for_sequential) # FunctionTool handles async
+
+poi_coordinate_fetcher_agent_wrapper = Agent(
+    name="POICoordinateFetcherWrapper",
     model=MODEL_NAME,
-    instruction="You are a data structuring expert. Given a list of POIs (each POI should have 'name', 'address', 'lat', and 'lng'), structure this data into a clean list of dictionaries. Each dictionary in the output list must represent a POI and contain exactly the following keys: 'name' (string), 'description' (string - use the POI's 'address' for this field), 'lat' (float), and 'lng' (float). Ensure lat and lng are correctly formatted as floating-point numbers. Filter out any POIs that are missing 'lat' or 'lng' or have error messages instead of coordinates.",
-    description="Structures POI data (name, description, lat/long) into a final list of dictionaries suitable for KML generation, ensuring 'lat' and 'lng' are floats."
+    instruction=f"""Your task is to ensure POIs have coordinates.
+    1. The previous step stored a JSON string of raw POIs in state key: '{STATE_KEY_RAW_POIS}'.
+    2. Call the 'fetch_coords_and_store_for_sequential' tool. This tool will update state key: '{STATE_KEY_POIS_WITH_COORDS}'.
+    3. Output the confirmation message from the tool.""",
+    tools=[fetch_coords_and_store_tool_for_seq],
 )
 
-# 4. KMLGeneratorAgent
-kml_generator_agent = Agent(
-    name="KMLGeneratorAgent",
+async def format_data_and_store_for_sequential(tool_context: ToolContext): # MODIFIED to be async
+    pois_with_coords_json_string = tool_context.state.get(STATE_KEY_POIS_WITH_COORDS)
+    if not pois_with_coords_json_string:
+        tool_context.state[STATE_KEY_FORMATTED_POIS] = json.dumps({"error": "No POIs with coordinates found in state for formatting."})
+        return "Error: No POIs with coordinates found in state for formatting."
+    try:
+        pois_with_coords = json.loads(pois_with_coords_json_string)
+        if not isinstance(pois_with_coords, list):
+             raise json.JSONDecodeError("POIs with coords is not a list", pois_with_coords_json_string, 0)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding pois_with_coords_json_string: {e}. Content: '{pois_with_coords_json_string}'")
+        tool_context.state[STATE_KEY_FORMATTED_POIS] = json.dumps({"error": f"Invalid JSON in POIs with coords state: {e}"})
+        return f"Error: Invalid JSON in POIs with coords state for formatting: {e}"
+
+    formatted_data = []
+    for poi in pois_with_coords:
+        if not isinstance(poi, dict) or "error" in poi or poi.get("lat") is None or poi.get("lng") is None:
+            continue
+        try:
+            lat = float(poi["lat"])
+            lng = float(poi["lng"])
+            formatted_data.append({
+                "name": poi.get("name", "Unknown POI"),
+                "description": poi.get("address", "No description available"),
+                "lat": lat,
+                "lng": lng,
+            })
+        except (ValueError, TypeError) as e:
+            print(f"Skipping POI due to invalid lat/lng: {poi}. Error: {e}")
+            continue
+
+    tool_context.state[STATE_KEY_FORMATTED_POIS] = json.dumps(formatted_data)
+    return f"Data formatting complete. Formatted {len(formatted_data)} POIs. Stored in state."
+
+format_data_and_store_tool_for_seq = FunctionTool(format_data_and_store_for_sequential) # FunctionTool handles async
+
+map_data_formatter_agent_wrapper = Agent(
+    name="MapDataFormatterWrapper",
     model=MODEL_NAME,
-    instruction="You are a map file generator. You will receive a structured list of POIs (each with 'name', 'description', 'lat', 'lng'). Use the 'generate_kml_content' tool to create KML content from this list. The tool will automatically save the KML as an artifact. After the tool call, confirm that the KML file has been generated by relaying the message from the tool, which includes the artifact name.",
-    description="Generates KML file content from structured POI data and saves it as an artifact.",
-    tools=[generate_kml_tool]
+    instruction=f"""Your task is to format POI data for KML generation.
+    1. The previous step stored a JSON string of POIs with coordinates in state key: '{STATE_KEY_POIS_WITH_COORDS}'.
+    2. Call the 'format_data_and_store_for_sequential' tool. This tool will update state key: '{STATE_KEY_FORMATTED_POIS}'.
+    3. Output the confirmation message from the tool.""",
+    tools=[format_data_and_store_tool_for_seq],
+)
+
+# MODIFIED: Make this function async and await the call to generate_kml_tool.func
+async def generate_kml_and_store_result_for_sequential(tool_context: ToolContext):
+    formatted_pois_json_string = tool_context.state.get(STATE_KEY_FORMATTED_POIS)
+    if not formatted_pois_json_string:
+        final_result = "Error: No formatted POI data found in state for KML generation."
+        tool_context.state[STATE_KEY_KML_RESULT] = final_result
+        return final_result
+    try:
+        formatted_pois = json.loads(formatted_pois_json_string)
+        if not isinstance(formatted_pois, list):
+            raise json.JSONDecodeError("Formatted POIs is not a list", formatted_pois_json_string, 0)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding formatted_pois_json_string: {e}. Content: '{formatted_pois_json_string}'")
+        final_result = f"Error: Invalid JSON in formatted POIs state for KML generation: {e}"
+        tool_context.state[STATE_KEY_KML_RESULT] = final_result
+        return final_result
+
+    # generate_kml_tool.func is now async (because generate_kml_content is async)
+    kml_confirmation = await generate_kml_tool.func(pois=formatted_pois, tool_context=tool_context)
+    tool_context.state[STATE_KEY_KML_RESULT] = kml_confirmation
+    return kml_confirmation
+
+generate_kml_and_store_result_tool_for_seq = FunctionTool(generate_kml_and_store_result_for_sequential) # FunctionTool handles async
+
+kml_generator_agent_wrapper = Agent(
+    name="KMLGeneratorAgentWrapper",
+    model=MODEL_NAME,
+    instruction=f"""Your task is to generate the KML file and provide the final confirmation.
+    1. The previous step stored a JSON string of formatted POI data in state key: '{STATE_KEY_FORMATTED_POIS}'.
+    2. Call the 'generate_kml_and_store_result_for_sequential' tool. This tool will generate KML, save it as an artifact, store the confirmation message into state key: '{STATE_KEY_KML_RESULT}', and return this same confirmation message.
+    3. Your final output MUST be the exact confirmation message returned by the tool.""",
+    tools=[generate_kml_and_store_result_tool_for_seq],
+)
+
+adventure_map_sequential_orchestrator = SequentialAgent(
+    name="AdventureMapSequentialOrchestrator",
+    description="Orchestrates a sequence of agents to research, geocode, format, and generate KML for an adventure.",
+    sub_agents=[
+        location_research_agent_wrapper,
+        poi_coordinate_fetcher_agent_wrapper,
+        map_data_formatter_agent_wrapper,
+        kml_generator_agent_wrapper,
+    ]
 )

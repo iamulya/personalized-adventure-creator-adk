@@ -10,6 +10,7 @@ from google.genai import types as genai_types
 from .config import GOOGLE_MAPS_API_KEY
 
 
+# search_places_text and geocode_address remain the same (they are synchronous)
 def search_places_text(query: str, tool_context: ToolContext) -> List[Dict[str, Any]]:
     """
     Searches for places based on a text query using Google Maps Places API (Text Search).
@@ -93,7 +94,8 @@ def geocode_address(address: str, tool_context: ToolContext) -> Dict[str, float]
 google_maps_geocoding_tool = FunctionTool(geocode_address)
 
 
-def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolContext) -> str:
+# MODIFIED: Make this function async and await save_artifact
+async def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolContext) -> str:
     """
     Generates KML content string from a list of Points of Interest (POIs).
     Each POI should be a dictionary with 'name', 'description', 'lat', and 'lng'.
@@ -132,11 +134,12 @@ def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolContext) 
 
     artifact_name = f"adventure_map_{uuid.uuid4().hex[:8]}.kml"
     try:
-        tool_context.save_artifact(artifact_name, genai_types.Part(text=kml_string))
+        # AWAIT THE ASYNC CALL
+        await tool_context.save_artifact(artifact_name, genai_types.Part(text=kml_string))
         print(f"[Tool Call: generate_kml_content] Saved KML to artifact: {artifact_name}")
         return f"KML file generated and saved as artifact: {artifact_name}"
     except Exception as e:
         print(f"Error saving artifact {artifact_name}: {e}")
         return f"Error saving KML artifact: {str(e)}"
 
-generate_kml_tool = FunctionTool(generate_kml_content)
+generate_kml_tool = FunctionTool(generate_kml_content) # FunctionTool handles async funcs

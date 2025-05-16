@@ -8,15 +8,15 @@ GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "YOUR_GCP_PROJECT_ID")
 
 # Google Maps API Key Secret
 MAPS_API_KEY_SECRET_ID = os.environ.get("MAPS_API_KEY_SECRET_ID", "YOUR_MAPS_API_KEY_SECRET_ID")
-MAPS_API_KEY_SECRET_VERSION = os.environ.get("MAPS_API_KEY_SECRET_VERSION", "latest")
+MAPS_API_KEY_SECRET_VERSION = os.environ.get("MAPS_API_KEY_SECRET_VERSION", "1")
 
 # Gemini API Key Secret (for ADK's model calls)
 GEMINI_API_KEY_SECRET_ID = os.environ.get("GEMINI_API_KEY_SECRET_ID", "YOUR_GEMINI_API_KEY_SECRET_ID")
-GEMINI_API_KEY_SECRET_VERSION = os.environ.get("GEMINI_API_KEY_SECRET_VERSION", "latest")
+GEMINI_API_KEY_SECRET_VERSION = os.environ.get("GEMINI_API_KEY_SECRET_VERSION", "1")
 
 
 # Define the model to be used by agents
-MODEL_NAME = "gemini-1.5-flash-latest" # Or "gemini-2.5-flash-preview-04-17" if available and preferred
+MODEL_NAME = "gemini-2.5-pro-preview-05-06"#"gemini-2.5-flash-preview-04-17" #"gemini-2.0-flash-exp" 
 
 # Global variables to store fetched API keys
 GOOGLE_MAPS_API_KEY: Optional[str] = None
