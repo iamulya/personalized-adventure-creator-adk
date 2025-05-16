@@ -23,7 +23,6 @@ adventure_creator/
 ├── agents.py          # Defines the specialized sub-agents
 └── app.py             # Defines the main orchestrator (root) agent
 ```
-
 ## Prerequisites
 
 1.  **Python 3.9+**
@@ -39,12 +38,19 @@ adventure_creator/
 
 ## Setup and Configuration
 
-1.  **Create Project Files:**
-    You can manually create the files as described in the "Project Structure" section and copy the Python code into them.
+1.  **Obtain Project Files:**
+    Ensure you have the project files (`__init__.py`, `config.py`, `custom_tools.py`, `agents.py`, `app.py`, `requirements.txt`) in a directory named `adventure_creator`.
 
 2.  **Install Dependencies:**
+    Navigate to the `adventure_creator` directory (or its parent if you prefer to create a virtual environment there) and run:
     ```bash
-    pip install google-adk google-cloud-secret-manager requests
+    pip install -r requirements.txt
+    ```
+    It's highly recommended to use a Python virtual environment:
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows: venv\Scripts\activate
+    pip install -r requirements.txt
     ```
 
 3.  **Configure `config.py` or Environment Variables:**
@@ -127,6 +133,5 @@ adventure_creator/
     *   Ensure the identity running the script has `Secret Manager Secret Accessor` permissions.
     *   Make sure the Google Maps Platform APIs (Places, Geocoding) are enabled for your Maps API key in the Google Cloud Console.
     *   Check for billing issues on your Google Cloud project.
-*   **"ModuleNotFoundError"**: Ensure you've run `pip install google-adk google-cloud-secret-manager requests`.
+*   **"ModuleNotFoundError"**: Ensure you've run `pip install -r requirements.txt`.
 *   **ADK Web UI Issues**: Make sure you are running `adk web` from the correct directory (the parent of `adventure_creator`).
-
