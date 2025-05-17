@@ -159,13 +159,26 @@ async def generate_kml_content_and_signed_url(pois: List[Dict[str, Any]], tool_c
 
             target_sa_email="adk-agents@genai-setup.iam.gserviceaccount.com"
 
+            from google import auth
+            principal_credentials, _ = auth.default(
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+
+            from google.auth import impersonated_credentials
+            impersonated_target_credentials = impersonated_credentials.Credentials(
+                    source_credentials=principal_credentials,
+                    target_principal=target_sa_email,
+                    target_scopes=['https://www.googleapis.com/auth/devstorage.read_write'], # Or more specific GCS scopes
+                    lifetime=120 # How long the impersonated credentials should be valid
+                )
+
             signed_url = blob.generate_signed_url(
                 version="v4",
                 expiration=datetime.timedelta(seconds=SIGNED_URL_EXPIRATION_SECONDS),
                 method="GET", 
-                service_account_email=target_sa_email,
-                access_token=None
+                credentials=impersonated_target_credentials, # Pass the impersonated credentials object
             )
+
             print(f"Generated signed URL: {signed_url}")
             return f"KML file generated and saved to Google Cloud Storage. Download (link expires in {SIGNED_URL_EXPIRATION_SECONDS // 60} mins): {signed_url}"
         except Exception as e:
