@@ -36,7 +36,7 @@ Delegate tasks appropriately.
         # effectively becomes the input_schema for the AgentTool wrapping the SequentialAgent.
         # ADK's AgentTool might not directly support input_schema for SequentialAgent in its constructor.
         # The LLM will need to call it as if its parameters are those of LocationResearchWrapperInput.
-        agent_tool.AgentTool(agent=adventure_map_sequential_orchestrator, skip_summarization=True)
+        agent_tool.AgentTool(agent=adventure_map_sequential_orchestrator)
     ],
     sub_agents=[]
 )
