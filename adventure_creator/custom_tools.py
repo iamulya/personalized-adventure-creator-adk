@@ -2,13 +2,19 @@
 import uuid
 import json
 from typing import Any, Dict, List, Optional
+import datetime
 
 import requests
 from google.adk.tools import FunctionTool, ToolContext
 from google.genai import types as genai_types
+from google.cloud import storage # For generating signed URL
 
-from .config import GOOGLE_MAPS_API_KEY
-
+from .config import (
+    GOOGLE_MAPS_API_KEY,
+    GCS_BUCKET_NAME_FOR_KML,
+    SIGNED_URL_EXPIRATION_SECONDS,
+    GCS_PROJECT_ID_FOR_BUCKET # Use this for the GCS client
+)
 
 # search_places_text and geocode_address remain the same (they are synchronous)
 def search_places_text(query: str, tool_context: ToolContext) -> List[Dict[str, Any]]:
@@ -95,7 +101,7 @@ google_maps_geocoding_tool = FunctionTool(geocode_address)
 
 
 # MODIFIED: Make this function async and await save_artifact
-async def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolContext) -> str:
+async def generate_kml_content_and_signed_url(pois: List[Dict[str, Any]], tool_context: ToolContext) -> str:
     """
     Generates KML content string from a list of Points of Interest (POIs).
     Each POI should be a dictionary with 'name', 'description', 'lat', and 'lng'.
@@ -106,7 +112,7 @@ async def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolCon
         '<kml xmlns="http://www.opengis.net/kml/2.2">',
         '  <Document>'
     ]
-    print(f"[Tool Call: generate_kml_content] Processing {len(pois)} POIs for KML generation.")
+    print(f"[Tool Call: generate_kml_content_and_signed_url] Processing {len(pois)} POIs.")
     for poi in pois:
         name = poi.get("name", "Untitled POI")
         description_raw = poi.get("description", poi.get("address", "No description"))
@@ -115,7 +121,7 @@ async def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolCon
         lng = poi.get("lng")
 
         if lat is None or lng is None:
-            print(f"Warning: Skipping POI '{name}' due to missing lat/lng.")
+            print(f"Warning: Skipping POI '{name}' due to missing lat/lng for KML.")
             continue
 
         name = name.replace('&', '&').replace('<', '<').replace('>', '>')
@@ -132,14 +138,44 @@ async def generate_kml_content(pois: List[Dict[str, Any]], tool_context: ToolCon
     kml_parts.extend(['  </Document>', '</kml>'])
     kml_string = "\n".join(kml_parts)
 
-    artifact_name = f"adventure_map_{uuid.uuid4().hex[:8]}.kml"
-    try:
-        # AWAIT THE ASYNC CALL
-        await tool_context.save_artifact(artifact_name, genai_types.Part(text=kml_string))
-        print(f"[Tool Call: generate_kml_content] Saved KML to artifact: {artifact_name}")
-        return f"KML file generated and saved as artifact: {artifact_name}"
-    except Exception as e:
-        print(f"Error saving artifact {artifact_name}: {e}")
-        return f"Error saving KML artifact: {str(e)}"
+    session_id = tool_context._invocation_context.session.id # type: ignore
+    # user_id = tool_context._invocation_context.user_id # type: ignore
+    # app_name = tool_context._invocation_context.app_name # type: ignore
 
-generate_kml_tool = FunctionTool(generate_kml_content) # FunctionTool handles async funcs
+    gcs_object_name = f"kml_files/{session_id}/adventure_map_{uuid.uuid4().hex[:8]}.kml"
+    adk_artifact_filename = f"adventure_map_{uuid.uuid4().hex[:8]}.kml" # For fallback
+
+    if GCS_BUCKET_NAME_FOR_KML != "YOUR_GCS_BUCKET_NAME_FOR_KML_FILES" and \
+       GCS_PROJECT_ID_FOR_BUCKET != "YOUR_GCS_PROJECT_ID_FOR_BUCKET":
+        try:
+            print(f"Attempting to save KML to GCS bucket '{GCS_BUCKET_NAME_FOR_KML}' in project '{GCS_PROJECT_ID_FOR_BUCKET}' as object '{gcs_object_name}'")
+            # Explicitly pass project to storage.Client if GCS_PROJECT_ID_FOR_BUCKET is set
+            # Otherwise, it relies on ADC's default project.
+            storage_client = storage.Client(project=GCS_PROJECT_ID_FOR_BUCKET)
+            bucket = storage_client.bucket(GCS_BUCKET_NAME_FOR_KML)
+            blob = bucket.blob(gcs_object_name)
+            blob.upload_from_string(kml_string, content_type='application/vnd.google-earth.kml+xml')
+            print(f"KML successfully uploaded to GCS: gs://{GCS_BUCKET_NAME_FOR_KML}/{gcs_object_name}")
+
+            target_sa_email="adk-agents@genai-setup.iam.gserviceaccount.com"
+
+            signed_url = blob.generate_signed_url(
+                version="v4",
+                expiration=datetime.timedelta(seconds=SIGNED_URL_EXPIRATION_SECONDS),
+                method="GET", 
+                service_account_email=target_sa_email,
+                access_token=None
+            )
+            print(f"Generated signed URL: {signed_url}")
+            return f"KML file generated and saved to Google Cloud Storage. Download (link expires in {SIGNED_URL_EXPIRATION_SECONDS // 60} mins): {signed_url}"
+        except Exception as e:
+            print(f"Error during GCS KML storage or signed URL generation: {e}")
+            print("Falling back to ADK in-memory artifact service.")
+            await tool_context.save_artifact(adk_artifact_filename, genai_types.Part(text=kml_string))
+            return f"Error saving to GCS. KML file saved to ADK artifacts as: {adk_artifact_filename}. GCS Error: {str(e)}"
+    else:
+        print("GCS bucket/project not configured. Saving KML to ADK in-memory artifact service.")
+        await tool_context.save_artifact(adk_artifact_filename, genai_types.Part(text=kml_string))
+        return f"KML file generated and saved as ADK artifact: {adk_artifact_filename}."
+
+generate_kml_tool_with_signed_url = FunctionTool(generate_kml_content_and_signed_url)

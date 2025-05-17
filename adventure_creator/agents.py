@@ -9,7 +9,7 @@ from .config import MODEL_NAME
 from .custom_tools import (
     google_maps_places_text_search_tool,
     google_maps_geocoding_tool,
-    generate_kml_tool # This is now an async FunctionTool
+    generate_kml_tool_with_signed_url # MODIFIED: Use the new tool
 )
 
 # --- State Keys for Sequential Agent ---
@@ -104,7 +104,7 @@ async def fetch_coords_and_store_for_sequential(tool_context: ToolContext): # MO
     tool_context.state[STATE_KEY_POIS_WITH_COORDS] = json.dumps(results_with_coords)
     return f"Coordinate fetching complete. Processed {len(raw_pois)} POIs. Stored in state."
 
-fetch_coords_and_store_tool_for_seq = FunctionTool(fetch_coords_and_store_for_sequential) # FunctionTool handles async
+fetch_coords_and_store_tool_for_seq = FunctionTool(fetch_coords_and_store_for_sequential)
 
 poi_coordinate_fetcher_agent_wrapper = Agent(
     name="POICoordinateFetcherWrapper",
@@ -116,11 +116,11 @@ poi_coordinate_fetcher_agent_wrapper = Agent(
     tools=[fetch_coords_and_store_tool_for_seq],
 )
 
-async def format_data_and_store_for_sequential(tool_context: ToolContext): # MODIFIED to be async
+async def format_data_and_store_for_sequential(tool_context: ToolContext):
     pois_with_coords_json_string = tool_context.state.get(STATE_KEY_POIS_WITH_COORDS)
     if not pois_with_coords_json_string:
-        tool_context.state[STATE_KEY_FORMATTED_POIS] = json.dumps({"error": "No POIs with coordinates found in state for formatting."})
-        return "Error: No POIs with coordinates found in state for formatting."
+        tool_context.state[STATE_KEY_FORMATTED_POIS] = json.dumps({"error": "No POIs with coords for formatting."})
+        return "Error: No POIs with coords for formatting."
     try:
         pois_with_coords = json.loads(pois_with_coords_json_string)
         if not isinstance(pois_with_coords, list):
@@ -161,9 +161,8 @@ map_data_formatter_agent_wrapper = Agent(
     3. Output the confirmation message from the tool.""",
     tools=[format_data_and_store_tool_for_seq],
 )
-
-# MODIFIED: Make this function async and await the call to generate_kml_tool.func
-async def generate_kml_and_store_result_for_sequential(tool_context: ToolContext):
+# MODIFIED: This function is now async
+async def generate_kml_and_store_result_for_sequential_gcs(tool_context: ToolContext):
     formatted_pois_json_string = tool_context.state.get(STATE_KEY_FORMATTED_POIS)
     if not formatted_pois_json_string:
         final_result = "Error: No formatted POI data found in state for KML generation."
@@ -179,30 +178,37 @@ async def generate_kml_and_store_result_for_sequential(tool_context: ToolContext
         tool_context.state[STATE_KEY_KML_RESULT] = final_result
         return final_result
 
-    # generate_kml_tool.func is now async (because generate_kml_content is async)
-    kml_confirmation = await generate_kml_tool.func(pois=formatted_pois, tool_context=tool_context)
-    tool_context.state[STATE_KEY_KML_RESULT] = kml_confirmation
-    return kml_confirmation
+    # Call the new async tool that handles GCS and signed URLs
+    kml_confirmation_or_url = await generate_kml_tool_with_signed_url.func(pois=formatted_pois, tool_context=tool_context)
+    tool_context.state[STATE_KEY_KML_RESULT] = kml_confirmation_or_url
+    return kml_confirmation_or_url
 
-generate_kml_and_store_result_tool_for_seq = FunctionTool(generate_kml_and_store_result_for_sequential) # FunctionTool handles async
+generate_kml_and_store_result_tool_for_seq_gcs = FunctionTool(generate_kml_and_store_result_for_sequential_gcs)
 
 kml_generator_agent_wrapper = Agent(
     name="KMLGeneratorAgentWrapper",
     model=MODEL_NAME,
-    instruction=f"""Your task is to generate the KML file and provide the final confirmation.
+    instruction=f"""Your task is to generate the KML file and provide the final confirmation or download URL.
     1. The previous step stored a JSON string of formatted POI data in state key: '{STATE_KEY_FORMATTED_POIS}'.
-    2. Call the 'generate_kml_and_store_result_for_sequential' tool. This tool will generate KML, save it as an artifact, store the confirmation message into state key: '{STATE_KEY_KML_RESULT}', and return this same confirmation message.
-    3. Your final output MUST be the exact confirmation message returned by the tool.""",
-    tools=[generate_kml_and_store_result_tool_for_seq],
+    2. Call the 'generate_kml_and_store_result_for_sequential_gcs' tool. This tool will:
+       a. Read the formatted POIs JSON string.
+       b. Generate KML, attempt to save it to Google Cloud Storage, and generate a signed URL.
+       c. If GCS operations succeed, it returns a message with the signed URL.
+       d. If GCS fails or is not configured, it saves to ADK artifacts and returns a message with the ADK artifact name.
+       e. Store this final message (URL or artifact name) into state key: '{STATE_KEY_KML_RESULT}'.
+       f. Return this same final message.
+    3. Your final output MUST be the exact message returned by the tool.
+    Example tool call: generate_kml_and_store_result_for_sequential_gcs()""",
+    tools=[generate_kml_and_store_result_tool_for_seq_gcs], # Use the new GCS-aware tool
 )
 
 adventure_map_sequential_orchestrator = SequentialAgent(
     name="AdventureMapSequentialOrchestrator",
-    description="Orchestrates a sequence of agents to research, geocode, format, and generate KML for an adventure.",
+    description="Orchestrates KML generation, saving to GCS with signed URL if possible.",
     sub_agents=[
         location_research_agent_wrapper,
         poi_coordinate_fetcher_agent_wrapper,
         map_data_formatter_agent_wrapper,
-        kml_generator_agent_wrapper,
+        kml_generator_agent_wrapper, # This now uses the GCS-aware tool internally
     ]
 )
